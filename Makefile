@@ -263,10 +263,10 @@ helm-check: helm-lint helm-template helm-kubeconform
 
 helm-smoke-kind:
 	kind create cluster --name codex-lb-smoke --image kindest/node:v1.35.0 --wait 120s
-	docker build -t ghcr.io/soju06/codex-lb:ci .
-	kind load docker-image ghcr.io/soju06/codex-lb:ci --name codex-lb-smoke
-	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=soju06/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh bundled
-	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=soju06/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh external-db
+	docker build -t ghcr.io/mikomiel/codex-lb:ci .
+	kind load docker-image ghcr.io/mikomiel/codex-lb:ci --name codex-lb-smoke
+	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=mikomiel/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh bundled
+	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=mikomiel/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh external-db
 
 .PHONY: ci-fast ci
 ci-fast: lint typecheck rust-check frontend-test test-unit package
