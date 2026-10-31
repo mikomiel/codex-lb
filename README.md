@@ -36,6 +36,13 @@ Load balancer for ChatGPT accounts. Pool multiple accounts, track usage, manage 
 
 ## Quick Start
 
+This fork stages a source-only serious-fixes candidate, not a released or
+production-validated build. Separately approved downstream distribution will be
+container-only at `ghcr.io/mikomiel/codex-lb`, with no fork PyPI packages or Helm
+charts. Release-version and failure-withdrawal gates still apply. The commands
+and deployment guides below describe upstream artifacts, not this unpublished
+candidate; upstream `uvx`, Nix and image references do not install these fixes.
+
 ```bash
 # Docker (recommended)
 docker volume create codex-lb-data

@@ -57,7 +57,6 @@ jobs:
         env:
           TAG: ${{ steps.verify.outputs.tag }}
           VERSION: ${{ steps.verify.outputs.version }}
-          PYPI_VERSION: ${{ steps.verify.outputs.pypi_version }}
           SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
@@ -90,9 +89,7 @@ jobs:
 
           ## Install / Run
           \`\`\`bash
-          uvx --from "codex-lb==${PYPI_VERSION}" codex-lb
-          docker pull ghcr.io/${GITHUB_REPOSITORY}:${VERSION}
-          helm install codex-lb oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts/codex-lb --version ${VERSION} --devel
+          docker pull ghcr.io/mikomiel/codex-lb:${VERSION}
           \`\`\`
 
           Promote this train by merging the normal release-please PR for ${VERSION%-beta.*}.

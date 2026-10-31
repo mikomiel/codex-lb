@@ -122,7 +122,6 @@ jobs:
           TAG: ${{ steps.prepare.outputs.tag }}
           VERSION: ${{ steps.prepare.outputs.version }}
           BASE_VERSION: ${{ steps.prepare.outputs.base_version }}
-          PYPI_VERSION: ${{ steps.prepare.outputs.pypi_version }}
           PREVIOUS_TAG: ${{ steps.prepare.outputs.previous_tag }}
           CHANGELOG_PATH: ${{ steps.prepare.outputs.changelog_path }}
           RELEASE_PR: ${{ steps.release_pr.outputs.number }}
@@ -162,9 +161,7 @@ jobs:
 
           ## Install after publish
           \`\`\`bash
-          uvx --from "codex-lb==${PYPI_VERSION}" codex-lb
-          docker pull ghcr.io/${GITHUB_REPOSITORY}:${VERSION}
-          helm install codex-lb oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts/codex-lb --version ${VERSION} --devel
+          docker pull ghcr.io/mikomiel/codex-lb:${VERSION}
           \`\`\`
 
           ## Promotion

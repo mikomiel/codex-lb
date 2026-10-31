@@ -30,7 +30,6 @@ jobs:
       base_version: ${{ steps.metadata.outputs.base_version }}
       channel: ${{ steps.metadata.outputs.channel }}
       is_prerelease: ${{ steps.metadata.outputs.is_prerelease }}
-      pypi_version: ${{ steps.metadata.outputs.pypi_version }}
       make_latest: ${{ steps.metadata.outputs.make_latest }}
 
     steps:
@@ -82,7 +81,7 @@ jobs:
 
   docker-image:
     name: Build and push Docker image
-    needs: [release-metadata]
+    needs: [build, release-metadata]
     runs-on: ubuntu-24.04
 
     permissions:
@@ -134,7 +133,7 @@ jobs:
           cache-from: type=gha,scope=codex-lb-release
           cache-to: type=gha,mode=max,scope=codex-lb-release
 
-      - name: Set lowercase image ref
+      - name: Set fork image ref
         id: image
         env:
           IMAGE_VERSION: ${{ steps.meta.outputs.version }}
@@ -160,7 +159,7 @@ jobs:
 
   create-github-release:
     name: Create GitHub Release
-    needs: [docker-image, release-metadata]
+    needs: [build, docker-image, release-metadata]
     runs-on: ubuntu-24.04
 
     permissions:
@@ -241,12 +240,10 @@ jobs:
             fs.writeFileSync("release_notes.md", `${data.body.trimEnd()}\n`);
             core.setOutput("tag_name", tag);
 
-      - name: Append install and contributors
+      - name: Append container install command
         shell: bash
         env:
           TAG_NAME: ${{ steps.prev_tag.outputs.tag_name }}
-          IS_PRERELEASE: ${{ needs.release-metadata.outputs.is_prerelease }}
-          PYPI_VERSION: ${{ needs.release-metadata.outputs.pypi_version }}
         run: |
           set -euo pipefail
           TAG_VERSION="${TAG_NAME#v}"
@@ -270,7 +267,7 @@ jobs:
 
   withdraw-failed-release:
     name: Withdraw failed public release
-    needs: [release-metadata, docker-image, create-github-release]
+    needs: [release-metadata, build, docker-image, create-github-release]
     runs-on: ubuntu-24.04
     if: >-
       ${{
