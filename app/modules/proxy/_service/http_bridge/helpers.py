@@ -3319,8 +3319,12 @@ def _forwarded_http_bridge_session_key(
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
 ) -> _HTTPBridgeSessionKey | None:
+    # The forwarding client imports this module for its budget helper; resolve
+    # its shared wire decoder at request time rather than forming an import cycle.
+    from app.modules.proxy.http_bridge_forwarding import parse_owner_forward_affinity_key
+
     affinity_kind = forwarded_affinity_kind or _header_value_case_insensitive(headers, "x-codex-bridge-affinity-kind")
-    affinity_key = forwarded_affinity_key or _header_value_case_insensitive(headers, "x-codex-bridge-affinity-key")
+    affinity_key = forwarded_affinity_key or parse_owner_forward_affinity_key(headers)
     if affinity_kind is None or affinity_key is None:
         return None
     strength: Literal["hard", "soft"]

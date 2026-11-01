@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,10 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import get_settings
 from app.core.openai.requests import ResponsesRequest
 from app.modules.api_keys.service import ApiKeyUsageReservationData
+from app.modules.proxy import service as proxy_service
+from app.modules.proxy.affinity import _codex_backend_identity, _codex_session_selection_key
 from app.modules.proxy.http_bridge_forwarding import (
+    HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER,
     HTTP_BRIDGE_AFFINITY_KEY_HEADER,
     HTTP_BRIDGE_AFFINITY_KIND_HEADER,
     HTTP_BRIDGE_CLIENT_IP_HEADER,
@@ -648,6 +652,212 @@ def test_parse_forwarded_request_accepts_legacy_signature_when_client_ip_header_
     assert error is None
     assert forwarded is not None
     assert forwarded.context.client_ip is None
+
+
+@pytest.mark.parametrize("affinity_kind", ["session_header", "thread_header"])
+@pytest.mark.parametrize("unanchored", [False, True])
+@pytest.mark.parametrize("file_bound", [False, True])
+def test_namespaced_codex_affinity_survives_owner_forwarding(
+    affinity_kind: str, unanchored: bool, file_bound: bool
+) -> None:
+    payload = _payload_with_file() if file_bound else _payload()
+    identity = _codex_backend_identity({"session-id": "synthetic-process", "thread-id": "synthetic-thread"})
+    key = (
+        identity.thread_selection_key
+        if affinity_kind == "thread_header"
+        else _codex_session_selection_key("synthetic-process")
+    )
+    assert key is not None and key.startswith("\n")
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_request_unanchored=unanchored,
+        original_affinity_kind=affinity_kind,
+        original_affinity_key=key,
+        file_owner_account_id="synthetic-owner" if file_bound else None,
+        reservation=ApiKeyUsageReservationData(
+            reservation_id="synthetic-reservation", key_id="synthetic-key", model=payload.model
+        ),
+    )
+
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+
+    assert headers[HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER] == "base64url-v1"
+    signature_version = "2" if unanchored else None
+    assert headers[HTTP_BRIDGE_SIGNATURE_HEADER] == _bridge_forward_signature(
+        payload=payload, context=context, include_client_ip=False, signature_version=signature_version
+    )
+    assert headers[HTTP_BRIDGE_SIGNATURE_V2_HEADER] == _bridge_forward_tools_bound_signature(
+        payload=payload, context=context, signature_version=signature_version
+    )
+    for value in headers.values():
+        value.encode("ascii")
+        assert not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert error is None and forwarded is not None
+    assert forwarded.context.original_affinity_key == key
+    assert forwarded.context.original_affinity_kind == affinity_kind
+    assert forwarded.context.original_request_unanchored is unanchored
+    assert forwarded.context.file_owner_account_id == context.file_owner_account_id
+    assert forwarded.context.reservation == context.reservation
+    for extra in ({}, {"forwarded_affinity_kind": affinity_kind, "forwarded_affinity_key": key}):
+        session_key = proxy_service._forwarded_http_bridge_session_key(headers, None, **extra)
+        assert session_key is not None
+        assert session_key.affinity_kind == affinity_kind
+        assert session_key.affinity_key == key
+
+
+@pytest.mark.parametrize("unanchored", [False, True])
+def test_encoded_affinity_keeps_primary_signature_rollout(unanchored: bool) -> None:
+    payload = _payload()
+    key = _codex_session_selection_key("synthetic-process")
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_request_unanchored=unanchored,
+        original_affinity_kind="session_header",
+        original_affinity_key=key,
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    headers.pop(HTTP_BRIDGE_SIGNATURE_V2_HEADER)
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert error is None and forwarded is not None
+    assert forwarded.context.original_affinity_key == key
+
+
+@pytest.mark.parametrize("key", ["plain-session", "b64:YWJj", "base64url-v1:YWJj"])
+@pytest.mark.parametrize("unanchored", [False, True])
+@pytest.mark.parametrize("primary_only", [False, True])
+def test_legacy_affinity_key_text_is_not_reinterpreted(key: str, unanchored: bool, primary_only: bool) -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=False,
+        downstream_turn_state=None,
+        original_request_unanchored=unanchored,
+        original_affinity_kind="prompt_cache",
+        original_affinity_key=key,
+    )
+    headers = build_owner_forward_headers(
+        headers={HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER.upper(): "spoofed"}, payload=payload, context=context
+    )
+    assert headers[HTTP_BRIDGE_AFFINITY_KEY_HEADER] == key
+    assert HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER not in headers
+    assert HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER.upper() not in headers
+    if primary_only:
+        headers.pop(HTTP_BRIDGE_SIGNATURE_V2_HEADER)
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert error is None and forwarded is not None
+    assert forwarded.context.original_affinity_key == key
+    session_key = proxy_service._forwarded_http_bridge_session_key(headers, None)
+    assert session_key is not None and session_key.affinity_key == key and session_key.strength == "soft"
+
+
+@pytest.mark.parametrize("encoding", ["", "b64", "base64url-v2", "BASE64URL-V1", "base64url-v1 "])
+def test_owner_forward_rejects_unknown_affinity_key_encoding(encoding: str) -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_affinity_kind="session_header",
+        original_affinity_key="plain-session",
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    headers[HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER] = encoding
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert forwarded is None and error is not None
+    assert error.status_code == 400 and error.payload["error"]["code"] == "bridge_forward_invalid"
+    with pytest.raises(ProxyResponseError):
+        proxy_service._forwarded_http_bridge_session_key(headers, None)
+
+
+@pytest.mark.parametrize(
+    "wire_key",
+    [
+        None,
+        "",
+        "!!!",
+        "é",
+        "wA==",
+        "cGxhaW4=",  # missing, malformed, invalid UTF-8, or no namespace
+        base64.urlsafe_b64encode(b"\ncodex-lb-affinity-v1:bad\r\nInjected: value").decode(),
+        base64.urlsafe_b64encode(b"\ncodex-lb-affinity-v1:bad\x00").decode(),
+        base64.urlsafe_b64encode(b"\ncodex-lb-affinity-v1:bad\x7f").decode(),
+        base64.urlsafe_b64encode(b"\ncodex-lb-affinity-v1:valid").decode() + "=",  # excess padding
+    ],
+)
+def test_owner_forward_rejects_malformed_encoded_affinity(wire_key: str | None) -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_affinity_kind="session_header",
+        original_affinity_key="plain-session",
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    headers[HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER] = "base64url-v1"
+    if wire_key is None:
+        headers.pop(HTTP_BRIDGE_AFFINITY_KEY_HEADER)
+    else:
+        headers[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = wire_key
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert forwarded is None and error is not None and error.status_code == 400
+    assert error.payload["error"]["code"] == "bridge_forward_invalid"
+    with pytest.raises(ProxyResponseError):
+        proxy_service._forwarded_http_bridge_session_key(headers, None)
+
+
+@pytest.mark.parametrize("unanchored", [False, True])
+@pytest.mark.parametrize("tamper", ["strip_encoding", "replace_key", "affinity_kind", "payload"])
+def test_encoded_affinity_remains_signature_bound(unanchored: bool, tamper: str) -> None:
+    payload = _payload()
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_request_unanchored=unanchored,
+        original_affinity_kind="session_header",
+        original_affinity_key=_codex_session_selection_key("synthetic-process"),
+    )
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+    if tamper == "strip_encoding":
+        headers.pop(HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER)
+    elif tamper == "replace_key":
+        headers[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = base64.urlsafe_b64encode(
+            _codex_session_selection_key("another-process").encode()
+        ).decode()
+    elif tamper == "affinity_kind":
+        headers[HTTP_BRIDGE_AFFINITY_KIND_HEADER] = "prompt_cache"
+    else:
+        payload.instructions = "changed"
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+    assert forwarded is None and error is not None
+    assert error.payload["error"]["code"] == "bridge_forward_invalid"
+
+
+@pytest.mark.parametrize("suffix", ["\r", "\n", "\x00", "\x7f"])
+def test_namespaced_affinity_does_not_bypass_other_control_guards(suffix: str) -> None:
+    context = HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state=None,
+        original_affinity_kind="session_header",
+        original_affinity_key=_codex_session_selection_key("synthetic-process") + suffix,
+    )
+    with pytest.raises(ProxyResponseError) as error:
+        build_owner_forward_headers(headers={}, payload=_payload(), context=context)
+    assert error.value.payload["error"]["code"] == "bridge_forward_invalid"
 
 
 def test_build_owner_forward_headers_preserves_original_affinity_key() -> None:

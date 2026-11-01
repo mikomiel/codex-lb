@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -23,6 +24,7 @@ from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
 from app.modules.api_keys.service import ApiKeyUsageReservationData
 from app.modules.proxy._service.http_bridge.helpers import _http_bridge_request_budget_seconds
+from app.modules.proxy.affinity import _CODEX_SELECTION_KEY_PREFIX
 
 # HTTP-only and hop-by-hop headers that must not be forwarded through the
 # internal bridge. These headers are either illegal in WebSocket handshakes or
@@ -56,6 +58,8 @@ HTTP_BRIDGE_RESERVATION_KEY_ID_HEADER = "x-codex-bridge-reservation-key-id"
 HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
+HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER = "x-codex-bridge-affinity-key-encoding"
+_AFFINITY_KEY_ENCODING = "base64url-v1"
 HTTP_BRIDGE_FILE_OWNER_HEADER = "x-codex-bridge-file-owner"
 HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER = "x-codex-bridge-original-unanchored"
 HTTP_BRIDGE_SIGNATURE_VERSION_HEADER = "x-codex-bridge-signature-version"
@@ -151,13 +155,46 @@ def _reject_illegal_bridge_header_value(name: str, value: str | None) -> None:
     )
 
 
-def _validate_bridge_forward_context_headers(context: HTTPBridgeForwardContext) -> None:
+def _owner_forward_affinity_key_header(key: str | None) -> tuple[str | None, str | None]:
+    # Only server-namespaced selection keys have a deliberate leading LF.
+    # Other reconstructed metadata must still pass the existing wire guard.
+    if key is not None and key.startswith(f"{_CODEX_SELECTION_KEY_PREFIX}:"):
+        _reject_illegal_bridge_header_value(HTTP_BRIDGE_AFFINITY_KEY_HEADER, key[1:])
+        return base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii"), _AFFINITY_KEY_ENCODING
+    return key, None
+
+
+def parse_owner_forward_affinity_key(headers: Mapping[str, str]) -> str | None:
+    key = next((value for name, value in headers.items() if name.lower() == HTTP_BRIDGE_AFFINITY_KEY_HEADER), None)
+    encoding = next(
+        (value for name, value in headers.items() if name.lower() == HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER), None
+    )
+    if encoding is None:
+        return _optional_header(key)
+    try:
+        if encoding != _AFFINITY_KEY_ENCODING or key is None:
+            raise ValueError("Unsupported affinity key encoding")
+        data = base64.b64decode(key, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(data).decode("ascii") != key:
+            raise ValueError("Noncanonical affinity key encoding")
+        decoded = data.decode("utf-8")
+        if not decoded.startswith(f"{_CODEX_SELECTION_KEY_PREFIX}:"):
+            raise ValueError("Not a namespaced affinity key")
+        _reject_illegal_bridge_header_value(HTTP_BRIDGE_AFFINITY_KEY_HEADER, decoded[1:])
+        return decoded
+    except ValueError:
+        raise _invalid_bridge_forward_signature_error() from None
+
+
+def _validate_bridge_forward_context_headers(
+    context: HTTPBridgeForwardContext, *, affinity_key_header: str | None
+) -> None:
     for name, value in (
         (HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, context.origin_instance),
         (HTTP_BRIDGE_TARGET_INSTANCE_HEADER, context.target_instance),
         ("x-codex-turn-state", context.downstream_turn_state),
         (HTTP_BRIDGE_AFFINITY_KIND_HEADER, context.original_affinity_kind),
-        (HTTP_BRIDGE_AFFINITY_KEY_HEADER, context.original_affinity_key),
+        (HTTP_BRIDGE_AFFINITY_KEY_HEADER, affinity_key_header),
         (HTTP_BRIDGE_FILE_OWNER_HEADER, context.file_owner_account_id),
         (HTTP_BRIDGE_CLIENT_IP_HEADER, context.client_ip),
     ):
@@ -291,7 +328,8 @@ def build_owner_forward_headers(
     # WebSocket client metadata is reconstructed as a header mapping without
     # passing through an HTTP parser. Validate it before signing so aiohttp is
     # never the first component to discover illegal wire bytes.
-    _validate_bridge_forward_context_headers(context)
+    affinity_key_header, affinity_key_encoding = _owner_forward_affinity_key_header(context.original_affinity_key)
+    _validate_bridge_forward_context_headers(context, affinity_key_header=affinity_key_header)
     filtered = filter_inbound_headers(headers)
     # Per the hop-by-hop contract, also drop any header named by the inbound
     # Connection header in addition to the fixed unsafe set.
@@ -333,9 +371,11 @@ def build_owner_forward_headers(
     if signature_version is not None:
         forwarded[HTTP_BRIDGE_SIGNATURE_VERSION_HEADER] = signature_version
         forwarded[HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER] = "1"
-    if context.original_affinity_kind and context.original_affinity_key:
+    if context.original_affinity_kind and affinity_key_header:
         forwarded[HTTP_BRIDGE_AFFINITY_KIND_HEADER] = context.original_affinity_kind
-        forwarded[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = context.original_affinity_key
+        forwarded[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = affinity_key_header
+        if affinity_key_encoding is not None:
+            forwarded[HTTP_BRIDGE_AFFINITY_KEY_ENCODING_HEADER] = affinity_key_encoding
     if context.file_owner_account_id:
         # This proof is accepted only with the full-context signature below;
         # the legacy primary signature intentionally remains byte-compatible.
@@ -415,6 +455,10 @@ def parse_forwarded_request(
         original_request_unanchored = False
     else:
         return None, _invalid_bridge_forward_signature_error()
+    try:
+        affinity_key = parse_owner_forward_affinity_key(headers)
+    except ProxyResponseError as error:
+        return None, error
     context = HTTPBridgeForwardContext(
         origin_instance=headers.get(HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, "").strip() or "unknown",
         target_instance=target_instance,
@@ -422,7 +466,7 @@ def parse_forwarded_request(
         downstream_turn_state=_optional_header(headers.get("x-codex-turn-state")),
         original_request_unanchored=original_request_unanchored,
         original_affinity_kind=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KIND_HEADER)),
-        original_affinity_key=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER)),
+        original_affinity_key=affinity_key,
         file_owner_account_id=_optional_header(headers.get(HTTP_BRIDGE_FILE_OWNER_HEADER)),
         client_ip=client_ip,
         reservation=_reservation_from_headers(headers),
