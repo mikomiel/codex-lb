@@ -1,6 +1,6 @@
 {
   "projectName": "codex-lb",
-  "projectOwner": "Soju06",
+  "projectOwner": "mikomiel",
   "repoType": "github",
   "repoHost": "https://github.com",
   "files": [
@@ -1557,6 +1557,17 @@
       "name": "⃟",
       "avatar_url": "https://avatars.githubusercontent.com/u/252236154?v=4",
       "profile": "https://github.com/TheFoolThatDoesntBelongToThisEra",
+      "contributions": [
+        "code",
+        "test",
+        "doc"
+      ]
+    },
+    {
+      "login": "mikomiel",
+      "name": "Mikołaj Mielczarek",
+      "avatar_url": "https://avatars.githubusercontent.com/u/86711023?v=4",
+      "profile": "https://github.com/mikomiel",
       "contributions": [
         "code",
         "test",
