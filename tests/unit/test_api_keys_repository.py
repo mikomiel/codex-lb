@@ -5,12 +5,39 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import BigInteger
+from sqlalchemy.dialects.postgresql import asyncpg, psycopg
 from sqlalchemy.dialects.postgresql import dialect as postgresql_dialect
+from sqlalchemy.engine import Dialect
 
 from app.db.models import ApiKeyLimit, LimitType, LimitWindow
 from app.modules.api_keys.repository import ApiKeyAccountCost, ApiKeysRepository
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", [asyncpg.dialect(), psycopg.dialect()], ids=["asyncpg", "psycopg"])
+@pytest.mark.parametrize("delta", [-5_000_000_000, -5, 5, 5_000_000_000])
+async def test_counter_adjustment_binds_large_values_as_bigint_on_postgresql(dialect: Dialect, delta: int) -> None:
+    session = AsyncMock()
+    repo = ApiKeysRepository(session)
+    compiled_statements = []
+
+    async def _execute(statement):
+        compiled_statements.append(statement.compile(dialect=dialect))
+        return SimpleNamespace(scalar_one_or_none=lambda: 101)
+
+    session.execute.side_effect = _execute
+    assert await repo.adjust_reserved_usage(101, delta=delta, expected_reset_at=datetime(2026, 5, 8))
+    assert len(compiled_statements) == 1
+    compiled = compiled_statements[0]
+    large_binds = [
+        bind for bind in compiled.binds.values() if isinstance(bind.value, int) and abs(bind.value) > 2**31 - 1
+    ]
+    assert any(bind.value == 2**63 - 1 for bind in large_binds)
+    assert all(isinstance(bind.type, BigInteger) for bind in large_binds)
+    assert "::BIGINT" in str(compiled)
 
 
 @pytest.mark.asyncio
@@ -23,10 +50,11 @@ async def test_reset_expired_limits_counts_successful_updates_without_rowcount()
         SimpleNamespace(id=102, reset_at=now - timedelta(days=14), limit_window=LimitWindow.WEEKLY),
     ]
 
+    later_limit = SimpleNamespace(id=103, reset_at=now - timedelta(days=60), limit_window=LimitWindow.MONTHLY)
     executed_sql: list[str] = []
 
     async def _execute(statement):
-        executed_sql.append(str(statement))
+        executed_sql.append(str(statement.compile(compile_kwargs={"literal_binds": True})))
         call_index = len(executed_sql)
         if call_index == 1:
             return SimpleNamespace(all=lambda: expired_limits)
@@ -35,6 +63,10 @@ async def test_reset_expired_limits_counts_successful_updates_without_rowcount()
         if call_index == 3:
             return SimpleNamespace(rowcount=-1, scalar_one_or_none=lambda: None)
         if call_index == 4:
+            return SimpleNamespace(all=lambda: [later_limit])
+        if call_index == 5:
+            return SimpleNamespace(rowcount=-1, scalar_one_or_none=lambda: 103)
+        if call_index == 6:
             return SimpleNamespace(all=lambda: [])
         raise AssertionError(f"unexpected execute call {call_index}")
 
@@ -42,11 +74,26 @@ async def test_reset_expired_limits_counts_successful_updates_without_rowcount()
 
     reset_count = await repo.reset_expired_limits(now=now)
 
-    assert reset_count == 1
-    assert len(executed_sql) == 4
+    assert reset_count == 2
+    assert len(executed_sql) == 6
     assert "RETURNING api_key_limits.id" in executed_sql[1]
     assert "RETURNING api_key_limits.id" in executed_sql[2]
-    session.commit.assert_awaited_once()
+    assert "ORDER BY api_key_limits.id ASC" in executed_sql[0]
+    assert "api_key_limits.id > 102" in executed_sql[3]
+    assert "api_key_limits.id > 103" in executed_sql[5]
+    assert session.commit.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reset_expired_limits_without_expired_rows_does_not_commit() -> None:
+    session = AsyncMock()
+    session.execute.return_value = SimpleNamespace(all=lambda: [])
+
+    reset_count = await ApiKeysRepository(session).reset_expired_limits(now=datetime(2026, 4, 23, 12, 0, 0))
+
+    assert reset_count == 0
+    session.execute.assert_awaited_once()
+    session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

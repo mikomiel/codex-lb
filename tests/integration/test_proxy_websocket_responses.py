@@ -50,6 +50,11 @@ from app.modules.proxy.capability_routing import (
     REQUIRED_CAPABILITY_HEADER,
     _capability_lineage_unavailable_error,
 )
+from tests.fixtures.encrypted_output import (
+    encrypted_output_events,
+    encrypted_output_items,
+    encrypted_output_replay_input,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -2677,6 +2682,85 @@ def test_backend_responses_websocket_proxies_and_persists_conversation_id(
     assert isinstance(latency_response_created_ms, int)
     assert isinstance(latency_first_token_ms, int)
     assert latency_first_upstream_event_ms <= latency_response_created_ms <= latency_first_token_ms
+
+
+@pytest.mark.parametrize("path", ["/backend-api/codex/responses", "/v1/responses"])
+def test_responses_websocket_preserves_encrypted_output_and_replay(app_instance, monkeypatch, path):
+    upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [_FakeUpstreamMessage("text", text=json.dumps(event)) for event in encrypted_output_events(response_id)]
+            for response_id in ("resp_encrypted_first", "resp_encrypted_second")
+        ],
+    )
+
+    async def seed_account():
+        async with SessionLocal() as session:
+            session.add(
+                Account(
+                    id="acct_encrypted_output",
+                    chatgpt_account_id="acct_encrypted_output",
+                    email="encrypted@example.com",
+                    plan_type="plus",
+                    access_token_encrypted=b"access",
+                    refresh_token_encrypted=b"refresh",
+                    id_token_encrypted=b"id",
+                    last_refresh=proxy_module.utcnow(),
+                    status=AccountStatus.ACTIVE,
+                )
+            )
+            await session.commit()
+
+    async def connect(self, *args, **kwargs):
+        return SimpleNamespace(id="acct_encrypted_output", codex_installation_id="synthetic-installation"), upstream
+
+    async def allow(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", connect)
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow)
+    include = ["reasoning.encrypted_content", "output.encrypted_content"]
+    with TestClient(app_instance) as client:
+        assert client.portal is not None
+        client.portal.call(seed_account)
+        with client.websocket_connect(path) as websocket:
+            for input_value in ("hello", encrypted_output_replay_input()):
+                websocket.send_json(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "instructions": "",
+                        "input": input_value,
+                        "include": include,
+                        "stream": True,
+                    }
+                )
+                events = []
+                for _ in range(2 + len(encrypted_output_items()) * 2):
+                    event = websocket.receive_json()
+                    assert event.get("type") not in {"error", "response.failed"}, event
+                    events.append(event)
+                    if event.get("type") == "response.completed":
+                        break
+                assert events[-1]["type"] == "response.completed"
+                assert events[-1]["response"]["output"] == encrypted_output_items()
+                for event_type in ("response.output_item.added", "response.output_item.done"):
+                    assert [
+                        event["item"] for event in events if event.get("type") == event_type
+                    ] == encrypted_output_items()
+    sent = [json.loads(text) for text in upstream.sent_text]
+    assert len(sent) == 2
+    assert all(payload["include"] == include for payload in sent)
+    assert sent[-1]["input"] == encrypted_output_replay_input()
+
+
+@pytest.mark.parametrize("path", ["/backend-api/codex/responses/", "/v1/responses/"])
+def test_responses_websocket_trailing_slash_remains_unsupported(app_instance, path):
+    with TestClient(app_instance) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(path):
+                pytest.fail("unsupported WebSocket route was accepted")
 
 
 def test_backend_responses_websocket_forwards_client_tools_byte_identical(app_instance, monkeypatch):
@@ -6354,6 +6438,131 @@ def test_responses_websocket_replays_client_full_resend_previous_response_miss_w
     assert "previous_response_id" not in replay_payload
     assert replay_payload["input"] == full_resend_input
     assert replay_payload["client_metadata"] == {"x-codex-installation-id": "account-installation"}
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/responses", "/backend-api/codex/responses"])
+def test_responses_websocket_close_replay_keeps_context_of_turn_chained_to_empty_prewarm(
+    endpoint,
+    app_instance,
+    monkeypatch,
+):
+    # Codex CLI opens a session with an empty ``generate: false`` prewarm that
+    # carries the tools and developer context, then sends the first turn as
+    # ``previous_response_id`` plus only the new items. If the upstream closes
+    # before accepting that turn, the replay must not drop the anchor: the new
+    # items alone lack everything the prewarm carried.
+    first_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp_ws_prewarm", "status": "in_progress"},
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_ws_prewarm",
+                                "status": "completed",
+                                "usage": {"input_tokens": 11000, "output_tokens": 0, "total_tokens": 11000},
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                ),
+            ],
+            [_FakeUpstreamMessage("close")],
+        ],
+    )
+    recovered_upstream = _recovered_upstream("resp_ws_prewarm_replay_unused")
+    connect_count = 0
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        nonlocal connect_count
+        connect_count += 1
+        upstream = first_upstream if connect_count == 1 else recovered_upstream
+        return SimpleNamespace(id="acct_ws_prewarm_replay", codex_installation_id="account-installation"), upstream
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+
+    prewarm_input = [
+        {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "shell"}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "workspace rules"}]},
+    ]
+    turn_delta = [
+        {"role": "user", "content": [{"type": "input_text", "text": "environment context"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "summarize the notes"}]},
+    ]
+    headers = {
+        "x-codex-turn-metadata": json.dumps(
+            {"request_kind": "prewarm", "turn_id": "turn_prewarm_replay"},
+            separators=(",", ":"),
+        )
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(endpoint, headers=headers) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "instructions": "",
+                        "generate": False,
+                        "input": prewarm_input,
+                        "stream": True,
+                    }
+                )
+            )
+            assert json.loads(websocket.receive_text())["type"] == "response.created"
+            assert json.loads(websocket.receive_text())["type"] == "response.completed"
+
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "instructions": "",
+                        "previous_response_id": "resp_ws_prewarm",
+                        "input": turn_delta,
+                        "stream": True,
+                    }
+                )
+            )
+            terminal = json.loads(websocket.receive_text())
+
+    turn_payload = json.loads(first_upstream.sent_text[-1])
+    assert turn_payload["previous_response_id"] == "resp_ws_prewarm"
+    assert turn_payload["input"] == turn_delta
+    # Without the anchor the replay would reach the model with only
+    # ``turn_delta``, so the turn fails and the client resends it in full.
+    assert recovered_upstream.sent_text == []
+    assert connect_count == 1
+    assert terminal["type"] == "response.failed"
+    assert terminal["response"]["error"]["code"] == "stream_incomplete"
 
 
 def test_v1_responses_websocket_masks_invalid_request_previous_response_not_found_without_retry(

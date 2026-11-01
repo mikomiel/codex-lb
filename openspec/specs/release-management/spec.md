@@ -90,8 +90,10 @@ The release publishing workflow SHALL accept both stable tags (`vX.Y.Z`) and pre
 
 A beta-tested release train SHALL be promoted by merging the normal
 release-please stable release PR for the corresponding base version. Stable
-promotion SHALL rebuild PyPI, Docker, Helm, and GitHub Release artifacts with
-the stable version instead of retagging prerelease artifacts.
+promotion in this fork SHALL rebuild the container image and GitHub Release
+metadata with the stable version instead of retagging prerelease artifacts.
+The fork SHALL NOT publish PyPI packages or Helm charts. Release notes SHALL
+advertise only the fork-owned container image.
 
 Before the stable release PR for `X.Y.Z` is merged, every change in the
 release candidate SHALL either be covered by a `vX.Y.Z-beta.N` prerelease
@@ -191,12 +193,12 @@ Stable release promotion pull requests SHALL fail CI unless every release-manage
 
 ### Requirement: Failed release publishing withdraws public release metadata
 
-If the Release workflow is triggered by a public GitHub Release event and any required publishing job fails, the workflow SHALL make that GitHub Release draft again before exiting. This prevents `/releases/latest` and dashboard update checks from advertising a version whose PyPI, Docker, or Helm artifacts are incomplete.
+If the Release workflow is triggered by a public GitHub Release event and any required publishing job fails, the workflow SHALL make that GitHub Release draft again before exiting. This prevents `/releases/latest` and dashboard update checks from advertising a version whose container artifact or release-version verification is incomplete.
 
 #### Scenario: stable release workflow fails before artifacts publish
 
 - **GIVEN** GitHub Release `v1.20.0` was published and triggered the Release workflow
-- **AND** the workflow fails before PyPI, Docker, and Helm artifacts are all published
+- **AND** the release-version verification or required container publishing job fails
 - **WHEN** the failure cleanup job runs
 - **THEN** the GitHub Release is changed back to draft
 - **AND** the release no longer appears as the public latest release

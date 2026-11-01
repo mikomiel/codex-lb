@@ -90,6 +90,7 @@ from app.modules.proxy._service.http_bridge.accepted_replay import (
     _http_bridge_accepted_replay_may_exclude_account,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE,
     _HTTP_BRIDGE_COOLDOWN_SUPPRESSION_ATTR,
     _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR,
     _await_task_deferring_cancellation,
@@ -105,6 +106,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_precreated_retry_failure_error,
     _http_bridge_prewarm_enabled,
     _http_bridge_request_budget_seconds,
+    _http_bridge_request_can_renew_upstream,
     _http_bridge_request_counts_against_queue,
     _http_bridge_request_state_holds_safe_replay,
     _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
@@ -132,6 +134,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _estimated_lease_tokens_from_request_usage_budget,
     _fingerprint_input_items,
     _inline_top_level_input_image_urls,
+    _install_fresh_replay_body,
     _normalize_service_tier_value,
     _normalize_session_id,
     _prepare_websocket_request_state_for_account_switch,
@@ -1772,6 +1775,9 @@ class _HTTPBridgeRequestSubmitMixin:
             await _await_task_deferring_cancellation(cleanup_task)
             raise
         try:
+            text_data = await self._maybe_renew_http_bridge_upstream(
+                session, request_state=request_state, text_data=text_data
+            )
             await self._maybe_prewarm_http_bridge_session(
                 session,
                 request_state=request_state,
@@ -3619,6 +3625,71 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
 
+    async def _maybe_renew_http_bridge_upstream(
+        self: Any,
+        session: _HTTPBridgeSession,
+        *,
+        request_state: _WebSocketRequestState,
+        text_data: str,
+    ) -> str:
+        """Rotate an old idle transport, not its context or durable owner."""
+        clock = clock_for(self)
+
+        def needs_renewal() -> bool:
+            return bool(
+                session.upstream_control.opened_at is not None
+                and clock.monotonic() - session.upstream_control.opened_at
+                >= _http_bridge_helpers.HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS
+                and not session.upstream_event_processing_count
+                and not session.closed
+                and not session.upstream_control.retire_after_drain
+                and _http_bridge_request_can_renew_upstream(request_state)
+            )
+
+        if not needs_renewal():
+            return text_data
+        # Resolve a possibly expired cache row outside lifecycle_lock.
+        dashboard_settings = await _service_get_settings_cache().get()
+        async with session.lifecycle_lock:
+            if not needs_renewal():
+                return text_data
+            async with session.pending_lock:
+                if session.pending_requests or session.upstream_event_processing_count:
+                    # Terminal bookkeeping can outlive the pending deque. Never
+                    # cancel its reader before the completed response is delivered.
+                    return text_data
+            if session.account.id in request_state.excluded_account_ids or request_state.preferred_account_id not in {
+                None,
+                session.account.id,
+            }:
+                return text_data
+            request_state.preferred_account_id = session.account.id
+            await self._reconnect_http_bridge_session(
+                session,
+                request_state=request_state,
+                restart_reader=True,
+                require_same_account=True,
+                require_preferred_account=True,
+                dashboard_settings=dashboard_settings,
+            )
+            if request_state.proxy_injected_previous_response_id:
+                assert request_state.fresh_upstream_request_text is not None
+                text_data = _install_fresh_replay_body(
+                    request_state,
+                    request_state.fresh_upstream_request_text,
+                    account_neutral=False,
+                    release_owner_pin=False,
+                )
+                _bind_http_bridge_proxy_injected_anchor(self, request_state, response_id=None, proxy_injected=False)
+            _log_http_bridge_event(
+                "renew_upstream",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                detail="upstream_max_age",
+            )
+        return text_data
+
     async def _retry_http_bridge_request_on_fresh_upstream(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -3762,6 +3833,12 @@ class _HTTPBridgeRequestSubmitMixin:
         )
 
         def request_is_retryable(request_state: _WebSocketRequestState) -> bool:
+            if request_state.precreated_replay_reason == _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE and (
+                not _http_bridge_request_can_renew_upstream(request_state)
+            ):
+                # This explicit refusal permits one replay, not the optional
+                # extra clean-close retries of the general transport path.
+                return False
             transport_only_unanchored_replay = bool(
                 request_state.precreated_replay_reason is None
                 and (
@@ -3877,6 +3954,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 # this point, not on a zero count.
                 retry_send_baselines.append((request_state, request_state.response_create_attempt_count))
             model_fallback_replay = request_state.precreated_replay_reason == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
+            connection_limit_replay = request_state.precreated_replay_reason == _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE
             if request_state.previous_response_id is not None and not (
                 request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
             ):
@@ -3894,7 +3972,8 @@ class _HTTPBridgeRequestSubmitMixin:
             close_generation = session.last_upstream_close_generation
             hard_session_affinity = session.key.strength == "hard"
             fresh_hard_request_account_switch_allowed = (
-                hard_session_affinity
+                not connection_limit_replay
+                and hard_session_affinity
                 and request_state.previous_response_id is None
                 and not request_state.hard_continuity_anchor
                 and not request_state.proxy_injected_previous_response_id
@@ -3922,7 +4001,28 @@ class _HTTPBridgeRequestSubmitMixin:
             if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
             account_bound_replay = False
-            if request_state.previous_response_id is not None:
+            if connection_limit_replay:
+                # This explicit transport refusal never moves accounts. Unlike
+                # capacity recovery, a complete body need not be account-neutral
+                # to replace our own anchor on the same owner.
+                if session.account.id in request_state.excluded_account_ids:
+                    return False
+                if request_state.proxy_injected_previous_response_id:
+                    assert request_state.fresh_upstream_request_text is not None
+                    _install_fresh_replay_body(
+                        request_state,
+                        request_state.fresh_upstream_request_text,
+                        account_neutral=False,
+                        release_owner_pin=False,
+                    )
+                    _bind_http_bridge_proxy_injected_anchor(self, request_state, response_id=None, proxy_injected=False)
+                request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                if request_text is None:
+                    return False
+                account_bound_replay = True
+                require_preferred_reconnect = True
+                request_state.preferred_account_id = session.account.id
+            elif request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
                 if account_neutral_recovery:
                     request_state.preferred_account_id = session.account.id
@@ -4051,7 +4151,15 @@ class _HTTPBridgeRequestSubmitMixin:
             # below acquires a lease for the account actually selected.
             if fresh_hard_request_account_switch_allowed:
                 await self._release_request_state_account_response_create_lease(request_state)
-            if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+            if connection_limit_replay:
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    require_same_account=True,
+                    require_preferred_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            elif hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,

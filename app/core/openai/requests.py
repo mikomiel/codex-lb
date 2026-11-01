@@ -51,6 +51,7 @@ _RESPONSES_INCLUDE_ALLOWLIST = {
     "message.input_image.image_url",
     "message.output_text.logprobs",
     "reasoning.encrypted_content",
+    "output.encrypted_content",
     "web_search_call.action.sources",
 }
 
@@ -365,7 +366,15 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
             changed = True
             continue
         role = item_mapping.get("role")
-        if role not in ("system", "developer"):
+        if role == "developer":
+            # Upstream accepts developer messages in ``input``, and
+            # ``previous_response_id`` carries ``input`` forward but not
+            # ``instructions``; hoisting would drop them from chained responses.
+            input_items.append(item)
+            # A developer-only input still needs ``instructions`` to default to "".
+            changed = True
+            continue
+        if role != "system":
             input_items.append(item)
             continue
         instruction_text, preserved_content = _split_responses_instruction_item_content(item_mapping)

@@ -223,6 +223,10 @@ _HTTP_BRIDGE_EVENTLESS_RESPONSE_CREATED_MAX_SECONDS = 60.0
 # attribute, and every consumer reads it through this module at call time.
 HTTP_BRIDGE_IDLE_TTL_SECONDS: Final = 120.0
 HTTP_BRIDGE_CODEX_IDLE_TTL_SECONDS: Final = 900.0
+# Upstream caps Responses sockets at 60 minutes even under continuous use.
+# Renew between turns with five minutes of headroom, never during generation.
+HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS: Final = 3300.0
+_HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE: Final = "websocket_connection_limit_reached"
 # Owner-side stuck handoff gate; anchored to the 300s wait Codex Desktop uses.
 HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS: Final = 300.0
 _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL = "missing_response_created_timeout"
@@ -1403,6 +1407,36 @@ def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketR
     if request_state.previous_response_id is not None:
         return not _http_bridge_request_state_holds_safe_replay(request_state)
     return request_state.hard_continuity_anchor and not _http_bridge_request_state_holds_safe_replay(request_state)
+
+
+def _http_bridge_request_can_renew_upstream(request_state: _WebSocketRequestState) -> bool:
+    """Renew only an unaccepted turn whose complete context is available.
+
+    A client-supplied continuation is not ours to discard. Only a proxy-added
+    anchor with a verified complete body can be removed for a fresh socket.
+    """
+    if (
+        request_state.response_id is not None
+        or request_state.response_event_count != 0
+        or not request_state.awaiting_response_created
+        or request_state.replay_count != 0
+        or request_state.downstream_visible
+        or request_state.upstream_model_output_seen
+        or request_state.last_downstream_sequence_number is not None
+        or request_state.deferred_reasoning_downstream_texts
+        or request_state.pending_function_call_ids
+        or request_state.pending_tool_call_types
+        or request_state.draining_until_terminal
+        or not request_state.request_text
+    ):
+        return False
+    if request_state.previous_response_id is None and not request_state.hard_continuity_anchor:
+        return True
+    return bool(
+        request_state.proxy_injected_previous_response_id
+        and request_state.fresh_upstream_request_is_retry_safe
+        and request_state.fresh_upstream_request_text
+    )
 
 
 def _http_bridge_request_state_holds_safe_replay(request_state: Any) -> bool:
@@ -3285,8 +3319,12 @@ def _forwarded_http_bridge_session_key(
     forwarded_affinity_kind: str | None = None,
     forwarded_affinity_key: str | None = None,
 ) -> _HTTPBridgeSessionKey | None:
+    # The forwarding client imports this module for its budget helper; resolve
+    # its shared wire decoder at request time rather than forming an import cycle.
+    from app.modules.proxy.http_bridge_forwarding import parse_owner_forward_affinity_key
+
     affinity_kind = forwarded_affinity_kind or _header_value_case_insensitive(headers, "x-codex-bridge-affinity-kind")
-    affinity_key = forwarded_affinity_key or _header_value_case_insensitive(headers, "x-codex-bridge-affinity-key")
+    affinity_key = forwarded_affinity_key or parse_owner_forward_affinity_key(headers)
     if affinity_kind is None or affinity_key is None:
         return None
     strength: Literal["hard", "soft"]

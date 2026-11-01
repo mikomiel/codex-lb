@@ -153,3 +153,30 @@ def test_release_guards_revalidate_pr_metadata_edits_in_their_own_workflow() -> 
     assert "python -m scripts.guard_beta_release" in beta_job
     assert "name: Stable release guard" in stable_job
     assert "python -m scripts.guard_stable_release" in stable_job
+
+
+def test_fork_release_version_gate_blocks_publication_and_drives_withdrawal() -> None:
+    workflow_path = CI_WORKFLOW.with_name("release.yml")
+    workflow = workflow_path.read_text(encoding="utf-8")
+    build = _job_block(workflow, "build")
+    image = _job_block(workflow, "docker-image")
+    release = _job_block(workflow, "create-github-release")
+    withdrawal = _job_block(workflow, "withdraw-failed-release")
+
+    assert 'python -m scripts.verify_release_version --tag "${RELEASE_TAG}"' in build
+    assert "ref: ${{ env.RELEASE_TAG }}" in build
+    assert "needs: [build, release-metadata]" in image
+    assert "needs: [build, docker-image, release-metadata]" in release
+    assert "needs: [release-metadata, build, docker-image, create-github-release]" in withdrawal
+    assert "always()" in withdrawal
+    assert "contains(needs.*.result, 'failure')" in withdrawal
+    assert "contains(needs.*.result, 'cancelled')" in withdrawal
+
+
+def test_fork_release_workflows_advertise_only_the_container_artifact() -> None:
+    for name in ("release.yml", "publish-beta-release.yml", "prepare-beta-release.yml"):
+        workflow = CI_WORKFLOW.with_name(name).read_text(encoding="utf-8")
+        assert "docker pull ghcr.io/" in workflow
+        assert "uvx --from" not in workflow
+        assert "helm install" not in workflow
+        assert "pypa/gh-action-pypi-publish" not in workflow

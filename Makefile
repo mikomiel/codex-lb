@@ -5,6 +5,7 @@ POSTGRES_PYTEST_TARGETS := \
 	tests/integration/test_affinity_invite_migration.py \
 	tests/integration/test_affinity_identity_migration.py \
 	tests/integration/test_cost_backfill.py \
+	tests/integration/test_api_key_credits.py \
 	tests/integration/test_atomic_quota_warmup_claims.py \
 	tests/integration/test_report_rollup.py \
 	tests/integration/test_reports_performance_api.py \
@@ -262,10 +263,10 @@ helm-check: helm-lint helm-template helm-kubeconform
 
 helm-smoke-kind:
 	kind create cluster --name codex-lb-smoke --image kindest/node:v1.35.0 --wait 120s
-	docker build -t ghcr.io/soju06/codex-lb:ci .
-	kind load docker-image ghcr.io/soju06/codex-lb:ci --name codex-lb-smoke
-	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=soju06/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh bundled
-	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=soju06/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh external-db
+	docker build -t ghcr.io/mikomiel/codex-lb:ci .
+	kind load docker-image ghcr.io/mikomiel/codex-lb:ci --name codex-lb-smoke
+	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=mikomiel/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh bundled
+	KUBE_CONTEXT=kind-codex-lb-smoke IMAGE_REGISTRY=ghcr.io IMAGE_REPOSITORY=mikomiel/codex-lb IMAGE_TAG=ci ./scripts/helm-kind-smoke.sh external-db
 
 .PHONY: ci-fast ci
 ci-fast: lint typecheck rust-check frontend-test test-unit package

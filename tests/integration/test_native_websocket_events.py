@@ -174,19 +174,22 @@ async def test_native_websocket_values_and_policy_match_python(monkeypatch: pyte
                         assert actual.sequence_number == expected.sequence_number, case["name"]
                         process = AsyncMock()
                         harness = SimpleNamespace(_process_parsed_http_bridge_upstream_event=process)
+                        bridge_session = SimpleNamespace(upstream_event_processing_count=0)
                         expected_bridge_payload = parse_sse_data_json_text(text)
                         with monkeypatch.context() as patch:
                             if interpreted and text.startswith("{") and "\n" not in text and "\r" not in text:
                                 patch.setattr(bridge, "parse_sse_data_json_text", reject_decode)
                             await bridge._HTTPBridgeUpstreamEventsMixin._process_http_bridge_upstream_text(
                                 harness,
-                                cast(Any, None),
+                                cast(Any, bridge_session),
                                 text,
                                 message=message,
                                 scheduler=REAL_SCHEDULER,
                                 clock=REAL_CLOCK,
                             )
                         assert process.await_args is not None
+                        assert process.await_args.args[0] is bridge_session
+                        assert bridge_session.upstream_event_processing_count == 0
                         processed = process.await_args.kwargs
                         assert json.dumps(processed["payload"]) == json.dumps(expected_bridge_payload), case["name"]
                         assert processed["text"] == text

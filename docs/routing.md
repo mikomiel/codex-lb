@@ -102,3 +102,42 @@ shows the LB-to-provider transport. `codex_lb_http_bridge_routing_total` separat
 `codex_lb_http_bridge_connections_total{event="reuse"}` measures actual connection
 reuse; admission counts are not successful-connection counts. Existing TTFT and
 queue latency metrics should be compared alongside reuse when measuring benefits.
+
+### Owner-forward affinity transport
+
+Internal session/thread selection keys deliberately start with LF so they cannot
+collide with legacy raw client headers. An owner forward transports these keys as
+canonical UTF-8 base64url in `x-codex-bridge-affinity-key`, with
+`x-codex-bridge-affinity-key-encoding: base64url-v1`. Signature verification and
+forwarded-session lookup decode the exact original key, including its LF; neither
+changes affinity kind, API-key scope, reservation or file ownership. Signatures
+still cover the logical key, not its wire encoding.
+
+Header-safe legacy keys are unchanged. A literal `b64:` prefix does not select an
+encoding. Externally supplied bridge headers are stripped, and unknown encodings,
+malformed data or additional illegal control characters are rejected. Coordinate
+any replica upgrade: an older owner cannot decode these newly encoded keys, so a
+mixed fleet can still reject an LF-key forward. This is source behavior, not proof
+of a live cross-replica rollout.
+
+### Upstream socket lifetime
+
+The HTTP bridge tracks total upstream socket age separately from idle TTLs. It
+renews a socket at 55 minutes between complete-context turns, before the provider's
+60-minute cap, while keeping the same account and durable bridge owner. Renewal
+never interrupts a pending response and does not consume the request retry.
+
+An explicit `websocket_connection_limit_reached` refusal before response
+acceptance can reconnect and retry once on the same account. This does not mark
+the account unhealthy. The proxy may replace its own injected response anchor
+only with a verified retained complete body. A client-owned continuation, missing
+context, response acceptance, output, reasoning, sequence, tool call or pending
+sibling prevents transparent replay. Such errors remain terminal; the expired
+socket retires after pending work drains. Lowering an idle TTL alone cannot
+prevent the lifetime cap under continuous traffic. Native WebSocket behavior is
+unchanged. A client turn-state-only continuation without a retained complete
+body also remains non-replayable. Continuously overlapping responses can still
+reach the upstream cap because renewal never interrupts pending work, including
+a popped terminal whose registration or delivery is still in progress. If a
+proactive reconnect fails, the turn fails closed with a server error rather than
+falling back to the reader that was already retired.

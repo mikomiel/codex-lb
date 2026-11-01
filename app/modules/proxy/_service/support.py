@@ -1397,6 +1397,9 @@ class _HTTPBridgeSession:
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
     last_upstream_event_generation: int = 0
+    # A popped terminal still belongs to the reader until bookkeeping and
+    # delivery finish. Empty pending_requests alone does not prove idleness.
+    upstream_event_processing_count: int = 0
     last_upstream_close_code: int | None = None
     last_upstream_close_generation: int = 0
     closed: bool = False
@@ -1558,6 +1561,9 @@ class _WebSocketContinuityState:
     last_pending_tool_call_types: dict[str, str] = field(default_factory=dict)
     responses_lite_model: str | None = None
     responses_lite_response_id: str | None = None
+    empty_prewarm_response_id: str | None = None
+    empty_prewarm_input_count: int = 0
+    empty_prewarm_input_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1568,6 +1574,9 @@ class _WebSocketContinuityAnchor:
 
 @dataclass(slots=True)
 class _WebSocketUpstreamControl:
+    # Socket generation birth, measured with the owning service's monotonic
+    # clock. Activity never refreshes this; replacements get a new control.
+    opened_at: float | None = field(default=None, kw_only=True)
     reconnect_requested: bool = False
     retire_after_drain: bool = False
     suppress_downstream_event: bool = False

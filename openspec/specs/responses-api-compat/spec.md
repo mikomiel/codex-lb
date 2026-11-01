@@ -5101,6 +5101,37 @@ to token-usage settlement.
 - **THEN** the request succeeds and settles from duration
 - **AND** the proxy does not return `usage_unavailable`
 
+### Requirement: Namespaced affinity keys survive owner forwarding
+
+Owner forwarding MUST encode internal LF-namespaced affinity keys as canonical UTF-8 base64url with an explicit versioned transport marker. Both signature verification and forwarded-session lookup MUST use the decoded logical key without trimming its LF. Encoding MUST NOT change affinity kind, API-key scope, reservation, file ownership or replay policy. Header-safe legacy keys without the marker MUST retain their original meaning.
+
+#### Scenario: A namespaced key crosses the owner hop
+- **GIVEN** a server-generated session or thread selection key with its LF namespace
+- **WHEN** an origin forwards the request to its owner in either signature mode
+- **THEN** the wire headers contain no illegal control characters
+- **AND** signature verification and session lookup recover the exact original key
+- **AND** file-owner and reservation proofs retain their existing meaning
+
+#### Scenario: A legacy key resembles an encoding prefix
+- **GIVEN** a legacy key such as `b64:YWJj` without an encoding marker
+- **WHEN** the owner receives a signed forward
+- **THEN** the key remains literal and is not decoded
+- **AND** the existing primary-signature compatibility path remains available
+
+### Requirement: Affinity encoding preserves forward authentication guards
+
+The origin MUST strip externally supplied internal bridge headers. Only the deliberate leading LF in the internal affinity namespace MAY be encoded; other illegal metadata controls MUST remain rejected. Unknown encodings, malformed or noncanonical base64url, invalid UTF-8 and decoded keys outside that namespace MUST fail closed. Removing the marker or changing the decoded identity MUST NOT bypass existing signature checks.
+
+#### Scenario: An encoded forward is tampered with
+- **GIVEN** a signed forward carrying a namespaced affinity key
+- **WHEN** its encoding marker is removed or its logical key, kind or payload changes
+- **THEN** the owner rejects the forward with `bridge_forward_invalid`
+
+#### Scenario: Encoded metadata is malformed
+- **WHEN** a forward declares an unsupported encoding or carries malformed encoded data
+- **THEN** it fails with `bridge_forward_invalid` before session selection
+- **AND** encoding does not make additional CR, LF, NUL or DEL characters acceptable
+
 ### Requirement: Upstream Responses payloads omit client-omitted request fields
 
 The service MUST NOT emit top-level request fields the client omitted onto
@@ -10896,3 +10927,93 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Responses accept encrypted output inclusion
+
+The service MUST accept `output.encrypted_content` in the `include` array of native and OpenAI-compatible Responses requests over HTTP and WebSocket. It MUST forward that selector unchanged, including when it accompanies `reasoning.encrypted_content`. Existing supported selectors and omitted or empty `include` arrays MUST retain their behavior. Unknown selectors, null arrays and non-string entries MUST remain invalid.
+
+#### Scenario: Encrypted output is requested through either Responses API
+- **WHEN** a client requests `include: ["reasoning.encrypted_content", "output.encrypted_content"]` through `/backend-api/codex/responses` or `/v1/responses`, using HTTP or a WebSocket `response.create`
+- **THEN** include validation succeeds
+- **AND** the upstream request retains both selectors
+
+#### Scenario: Existing selectors and defaults remain accepted
+- **WHEN** a request uses an existing supported selector or omits `include` or provides an empty array
+- **THEN** its include validation and forwarding behavior remain unchanged
+
+#### Scenario: Invalid include values remain rejected
+- **WHEN** a request contains an unknown include selector, a null include array, or a non-string array entry
+- **THEN** the request is rejected before upstream dispatch
+- **AND** the HTTP response is a 400 `invalid_request_error` whose parameter identifies `include` or its invalid entry
+
+### Requirement: Responses preserve opaque encrypted output for subsequent turns
+
+For supported output item types, the service MUST preserve `encrypted_content` string values, item IDs, message `phase`, tool `call_id` and `encrypted_function_args` when present through HTTP responses and WebSocket item events. Subsequent requests containing those returned items MUST retain those fields during forwarding. The existing public terminal-output backfill and native item-event semantics MUST remain unchanged. An input payload retaining ciphertext on a message or tool call MUST NOT be classified as account-neutral fresh replay, including after item-ID projection.
+
+#### Scenario: Encrypted items survive transport and replay
+- **WHEN** upstream returns supported encrypted output items and the client sends them back in the next turn
+- **THEN** the downstream output and next upstream input retain the opaque fields and corresponding item identities
+
+#### Scenario: Output arrives in item events before an empty terminal response
+- **WHEN** upstream emits encrypted items in `response.output_item.done` and an empty terminal `output` array
+- **THEN** native SSE preserves the item events and terminal semantics
+- **AND** public SSE and collected JSON responses backfill the same encrypted items
+
+#### Scenario: Ciphertext prevents account-neutral replay
+- **WHEN** an input payload retains encrypted message or tool-call content after any item-ID projection
+- **THEN** account-neutral fresh-replay classification rejects the payload
+
+### Requirement: HTTP bridge sockets have an independent maximum reuse age
+
+The HTTP bridge MUST record the monotonic opening time of each upstream socket, including replacements. At 3300 seconds it MUST renew before sending an unsent complete-context turn when no response or reader bookkeeping is pending. Renewal MUST keep the account and durable bridge identity, MUST NOT consume the request replay allowance, and MUST NOT interrupt another response. Idle activity MUST NOT reset socket age.
+
+#### Scenario: Continuous reuse does not extend socket lifetime
+- **GIVEN** a bridge socket is 3299 seconds old and was used recently
+- **WHEN** a complete standalone turn is submitted
+- **THEN** it reuses the socket
+- **WHEN** another such turn is submitted at socket age 3300 seconds
+- **THEN** it opens a new same-account socket before sending
+- **AND** subsequent age checks use the replacement socket's opening time
+
+#### Scenario: Renewal preserves complete proxy-owned context
+- **GIVEN** the proxy added a previous-response anchor and retained a verified complete request body
+- **WHEN** the old socket is renewed between turns
+- **THEN** the complete body replaces the proxy-added anchor
+- **AND** the durable session, account, previous-response ownership and turn-state ownership remain intact
+
+#### Scenario: Pending work is never interrupted for age renewal
+- **GIVEN** another response is pending or its popped terminal is still being registered or delivered
+- **WHEN** a new turn is submitted after the renewal threshold
+- **THEN** the bridge does not cancel the reader or close the socket for proactive renewal
+- **AND** the completed response and its continuity registration are delivered normally
+
+### Requirement: HTTP bridge lifetime refusals have a bounded same-owner recovery
+
+An explicit `websocket_connection_limit_reached` error before any response acceptance or output MAY retry once on a fresh same-account socket. The request MUST be the only pending turn, have no response identity in the error, and carry complete context. The bridge MUST NOT penalize or exclude the account for this transport lifetime. A failed or refused replay MUST NOT permit an additional clean-close replay.
+
+#### Scenario: The first unaccepted turn encounters the upstream cap
+- **GIVEN** upstream returns the lifetime error without any response events or response identity
+- **WHEN** the sole request has complete context and its retry is unused
+- **THEN** the bridge reconnects to the same account and sends the request once
+- **AND** a successful replacement produces the normal JSON or SSE response without exposing the first refusal
+
+#### Scenario: The replacement also refuses the request
+- **GIVEN** the request was already retried after a lifetime refusal
+- **WHEN** the replacement socket returns the error or closes cleanly
+- **THEN** the request terminates without a third send
+
+### Requirement: Lifetime recovery preserves context and output fences
+
+Lifetime renewal or recovery MUST NOT discard a client-supplied previous-response anchor or reconstruct context that was not retained. It MUST NOT replay an accepted response, visible output, reasoning prelude, sequenced event or pending tool call. Unsafe lifetime refusals MUST remain terminal and mark the expired socket for retirement after existing pending work drains. Native WebSocket replay rules MUST remain unchanged.
+
+#### Scenario: A continuation cannot be safely reconstructed
+- **GIVEN** the request depends on client-owned or unavailable context
+- **WHEN** its upstream socket reaches the lifetime cap
+- **THEN** no transparent replay strips its anchor or changes its owner
+- **AND** the existing terminal error is delivered
+
+#### Scenario: Output or another response already exists
+- **GIVEN** a response was accepted, produced output or reasoning, exposed a sequence, or has a pending sibling
+- **WHEN** the lifetime error arrives
+- **THEN** it is delivered without replay
+- **AND** existing pending work is not interrupted by proactive renewal

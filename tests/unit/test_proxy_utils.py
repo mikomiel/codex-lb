@@ -10014,6 +10014,82 @@ async def test_native_codex_stream_reraises_transport_failure_without_terminal_e
 
 
 @pytest.mark.asyncio
+async def test_native_transport_failure_after_event_closes_the_upstream_stream(monkeypatch) -> None:
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_native_giveup_lease")
+    lease = AccountLease(
+        lease_id="lease-native-giveup",
+        account_id=account.id,
+        kind="stream",
+        acquired_at=0.0,
+    )
+    settings = _make_proxy_settings()
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service._load_balancer,
+        "select_account",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None, lease=lease)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+    release_lease = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "release_account_lease", release_lease)
+
+    opened: list[int] = []
+    closed: list[int] = []
+
+    async def stream_then_transport_failure(*args, **kwargs):
+        del args, kwargs
+        generator_id = len(opened)
+        opened.append(generator_id)
+        try:
+            yield 'data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\n'
+            yield (
+                'data: {"type":"response.failed","_codex_lb_synthetic_transport_failure":true,'
+                '"response":{"status":"failed","error":{"code":"upstream_request_timeout",'
+                '"message":"Proxy request budget exhausted"}}}\n\n'
+            )
+        finally:
+            closed.append(generator_id)
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", stream_then_transport_failure)
+
+    chain = proxy_api._normalize_public_responses_stream(
+        proxy_api._stream_response_error_events(
+            service._stream_with_retry(
+                _make_transport_policy_payload(),
+                {"user-agent": "codex_exec/0.150.1 (Ubuntu; x86_64)", "originator": "codex_exec"},
+                codex_session_affinity=False,
+                propagate_http_errors=False,
+                openai_cache_affinity=False,
+                api_key=None,
+                api_key_reservation=None,
+                suppress_text_done_events=False,
+                request_transport="http",
+                upstream_stream_transport_override=None,
+            ),
+            owns_reservation=False,
+            reservation=None,
+            preserve_native_failure_lifecycle=True,
+        ),
+        preserve_native_failure_lifecycle=True,
+    )
+    with pytest.raises(proxy_module.ProxyResponseError):
+        async for _event in chain:
+            pass
+
+    # The native give-up raises from the middle of the chain while the
+    # upstream generator is suspended at its yield. Its finally must run,
+    # and the account lease must be released.
+    assert opened
+    release_lease.assert_any_await(lease)
+    assert closed == opened
+
+
+@pytest.mark.asyncio
 async def test_native_codex_stream_surfaces_local_pre_dispatch_refusal_as_unmarked_terminal() -> None:
     """A refusal the proxy raised before dispatch keeps its terminal event.
 
@@ -27172,6 +27248,39 @@ def test_websocket_client_previous_response_full_resend_retry_requires_matching_
     )
 
 
+def test_websocket_client_previous_response_full_resend_retry_rejects_delta_chained_to_empty_prewarm() -> None:
+    prewarm_input: list[JsonValue] = [
+        {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "shell"}]},
+        {"role": "developer", "content": [{"type": "input_text", "text": "workspace rules"}]},
+    ]
+    continuity_state = proxy_service._WebSocketContinuityState(
+        empty_prewarm_response_id="resp_prewarm",
+        empty_prewarm_input_count=len(prewarm_input),
+        empty_prewarm_input_fingerprint=proxy_service._fingerprint_input_items(prewarm_input),
+    )
+    turn_delta: list[JsonValue] = [
+        {"role": "user", "content": [{"type": "input_text", "text": "environment context"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "summarize the notes"}]},
+    ]
+
+    assert (
+        proxy_service._websocket_client_previous_response_full_resend_is_retry_safe(
+            previous_response_id="resp_prewarm",
+            input_value=turn_delta,
+            continuity_state=continuity_state,
+        )
+        is False
+    )
+    assert (
+        proxy_service._websocket_client_previous_response_full_resend_is_retry_safe(
+            previous_response_id="resp_prewarm",
+            input_value=[*prewarm_input, *turn_delta],
+            continuity_state=continuity_state,
+        )
+        is True
+    )
+
+
 def test_websocket_client_previous_response_full_resend_retry_rejects_tool_output_delta() -> None:
     tool_output_delta: list[JsonValue] = [
         {"type": "function_call_output", "call_id": "call_a", "output": "ok"},
@@ -30456,6 +30565,55 @@ async def test_finalize_websocket_empty_prewarm_does_not_store_continuity_anchor
     assert continuity_state.last_completed_response_id == "resp_existing"
     assert continuity_state.last_completed_input_count == 2
     assert continuity_state.last_completed_input_prefix_fingerprint == "existing-fingerprint"
+
+
+@pytest.mark.asyncio
+async def test_finalize_replayed_websocket_empty_prewarm_records_client_visible_id(monkeypatch):
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_ws_prewarm_replayed")
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock())
+
+    payload: dict[str, JsonValue] = {
+        "type": "response.completed",
+        "response": {
+            "id": "resp_ws_prewarm_hidden",
+            "usage": {"input_tokens": 9, "output_tokens": 0, "total_tokens": 9},
+        },
+    }
+    continuity_state = proxy_service._WebSocketContinuityState()
+    # The replay's upstream id stays hidden: every downstream event is rewritten
+    # to the id the client received first, so the next turn chains to that id.
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prewarm_replayed",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        request_kind="prewarm",
+        input_item_count=1,
+        input_full_fingerprint="prewarm-fingerprint",
+        response_id="resp_ws_prewarm_hidden",
+        replay_count=1,
+        replay_downstream_response_id="resp_ws_prewarm_visible",
+    )
+
+    await service._process_upstream_websocket_text(
+        json.dumps(payload),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        api_key=None,
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        response_create_gate=asyncio.Semaphore(1),
+        continuity_state=continuity_state,
+    )
+
+    assert continuity_state.empty_prewarm_response_id == "resp_ws_prewarm_visible"
+    assert continuity_state.empty_prewarm_input_count == 1
+    assert continuity_state.empty_prewarm_input_fingerprint == "prewarm-fingerprint"
 
 
 @pytest.mark.asyncio
