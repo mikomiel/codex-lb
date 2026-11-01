@@ -102,3 +102,25 @@ shows the LB-to-provider transport. `codex_lb_http_bridge_routing_total` separat
 `codex_lb_http_bridge_connections_total{event="reuse"}` measures actual connection
 reuse; admission counts are not successful-connection counts. Existing TTFT and
 queue latency metrics should be compared alongside reuse when measuring benefits.
+
+### Upstream socket lifetime
+
+The HTTP bridge tracks total upstream socket age separately from idle TTLs. It
+renews a socket at 55 minutes between complete-context turns, before the provider's
+60-minute cap, while keeping the same account and durable bridge owner. Renewal
+never interrupts a pending response and does not consume the request retry.
+
+An explicit `websocket_connection_limit_reached` refusal before response
+acceptance can reconnect and retry once on the same account. This does not mark
+the account unhealthy. The proxy may replace its own injected response anchor
+only with a verified retained complete body. A client-owned continuation, missing
+context, response acceptance, output, reasoning, sequence, tool call or pending
+sibling prevents transparent replay. Such errors remain terminal; the expired
+socket retires after pending work drains. Lowering an idle TTL alone cannot
+prevent the lifetime cap under continuous traffic. Native WebSocket behavior is
+unchanged. A client turn-state-only continuation without a retained complete
+body also remains non-replayable. Continuously overlapping responses can still
+reach the upstream cap because renewal never interrupts pending work, including
+a popped terminal whose registration or delivery is still in progress. If a
+proactive reconnect fails, the turn fails closed with a server error rather than
+falling back to the reader that was already retired.

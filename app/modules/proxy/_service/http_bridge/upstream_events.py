@@ -68,6 +68,7 @@ from app.modules.proxy._service.http_bridge.accepted_replay import (
     _stage_websocket_request_state_for_replay,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE,
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
     _await_task_deferring_cancellation,
     _forget_http_bridge_denied_anchor_fence,
@@ -78,6 +79,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_event_proves_upstream_liveness,
     _http_bridge_eventless_precreated_deadline,
     _http_bridge_request_budget_seconds,
+    _http_bridge_request_can_renew_upstream,
     _http_bridge_request_counts_against_queue,
     _http_bridge_request_state_holds_safe_replay,
     _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
@@ -2518,6 +2520,7 @@ class _HTTPBridgeUpstreamEventsMixin:
         event = parse_sse_event_payload(payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
         completed_delivery_scope = _HTTPBridgeCompletedDeliveryScope() if event_type == "response.completed" else None
         claimed_terminal_request_states: list[_WebSocketRequestState] = []
+        session.upstream_event_processing_count += 1
         try:
             await self._process_parsed_http_bridge_upstream_event(
                 session,
@@ -2548,6 +2551,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             for claimed_request_state in claimed_terminal_request_states:
                 claimed_request_state.terminal_settlement_phase = None
         finally:
+            session.upstream_event_processing_count -= 1
             if completed_delivery_scope is not None:
                 completed_delivery_scope.active = False
 
@@ -3418,7 +3422,36 @@ class _HTTPBridgeUpstreamEventsMixin:
             and _websocket_request_can_replay_before_visible_output(status_request_state)
             and _http_bridge_accepted_capacity_retry_allowed(status_request_state)
         )
+        connection_limit_error = (
+            event_type in {"error", "response.failed"}
+            and _normalize_error_code(
+                _websocket_event_error_code(event_type, payload), _websocket_event_error_type(event_type, payload)
+            )
+            == _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE
+        )
         if (
+            connection_limit_error
+            and status_request_state is not None
+            and response_id is None
+            and not has_other_pending_requests
+            and _http_bridge_request_can_renew_upstream(status_request_state)
+        ):
+            # The server explicitly refused this unaccepted turn. This is a
+            # transport lifetime, not capacity or account failure: reconnect
+            # once on the same owner without weakening any output/context fence.
+            status_request_state.precreated_replay_reason = _HTTP_BRIDGE_CONNECTION_LIMIT_ERROR_CODE
+            async with session.pending_lock:
+                if status_request_state not in session.pending_requests:
+                    session.pending_requests.appendleft(status_request_state)
+                    session.queued_request_count += 1
+            retried = await self._retry_http_bridge_precreated_request(session, request_state=status_request_state)
+            if retried:
+                return
+            async with session.pending_lock:
+                if status_request_state in session.pending_requests:
+                    session.pending_requests.remove(status_request_state)
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+        elif (
             auth_error_code is not None
             and not is_previous_response_not_found_event
             and status_request_state is not None
@@ -3709,6 +3742,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                         payload,
                         event_type,
                     ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+
+        if connection_limit_error:
+            # Even when replay is unsafe, never admit another turn on this
+            # expired socket. Existing accepted siblings retain their drain.
+            session.upstream_control.reconnect_requested = True
+            session.upstream_control.retire_after_drain = True
 
         completed_usage = (
             event.response.usage if event_type == "response.completed" and event and event.response else None

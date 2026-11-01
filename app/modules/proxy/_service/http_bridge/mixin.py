@@ -1951,7 +1951,7 @@ class _HTTPBridgeMixin(
             request_service_tier=request_service_tier,
             account=account,
             upstream=upstream,
-            upstream_control=_WebSocketUpstreamControl(),
+            upstream_control=_WebSocketUpstreamControl(opened_at=clock_for(self).monotonic()),
             pending_requests=deque(),
             pending_lock=fast_lock(),
             response_create_gate=asyncio.Semaphore(1),
@@ -2115,12 +2115,13 @@ class _HTTPBridgeMixin(
 
         async def open_replacement_upstream(selected_account: Any, selected_headers: dict[str, str]) -> Any:
             try:
-                return await self._open_upstream_websocket_with_budget(
+                upstream = await self._open_upstream_websocket_with_budget(
                     selected_account,
                     selected_headers,
                     timeout_seconds=self._remaining_budget_seconds(deadline),
                     request_state=request_state,
                 )
+                return upstream, clock_for(self).monotonic()
             except Exception:
                 session.closed = True
                 raise
@@ -2277,9 +2278,7 @@ class _HTTPBridgeMixin(
                 connect_headers = _websocket_safe_headers_with_turn_state(
                     session.headers, _http_bridge_reconnect_turn_state(session, account.id, owner_rebind_affinity)
                 )
-                upstream = await open_replacement_upstream(account, connect_headers)
-                _copy_websocket_route_metadata_to_session(session, request_state)
-                record_selected_account_takeover(account.id)
+                upstream, upstream_opened_at = await open_replacement_upstream(account, connect_headers)
                 break
             except ProxyResponseError as exc:
                 if exc.status_code != 401 or self._remaining_budget_seconds(deadline) <= 0:
@@ -2295,9 +2294,7 @@ class _HTTPBridgeMixin(
                     connect_headers = _websocket_safe_headers_with_turn_state(
                         session.headers, _http_bridge_reconnect_turn_state(session, account.id, owner_rebind_affinity)
                     )
-                    upstream = await open_replacement_upstream(account, connect_headers)
-                    _copy_websocket_route_metadata_to_session(session, request_state)
-                    record_selected_account_takeover(account.id)
+                    upstream, upstream_opened_at = await open_replacement_upstream(account, connect_headers)
                     break
                 except ProxyResponseError as retry_exc:
                     if retry_exc.status_code != 401:
@@ -2377,6 +2374,8 @@ class _HTTPBridgeMixin(
             complete_failed_handoff()
 
         try:
+            _copy_websocket_route_metadata_to_session(session, request_state)
+            record_selected_account_takeover(account.id)
             if owner_rebind_affinity is not None:
                 await self._claim_http_bridge_replacement_before_swap(
                     session,
@@ -2414,7 +2413,7 @@ class _HTTPBridgeMixin(
             session.account_lease = selected_account_lease
             session.replace_connection(account, connect_headers, upstream, _token_expiry(account, self._encryptor))
             session.catalog_omission_quota_admission = selection.catalog_omission_quota_admission
-            session.upstream_control = _WebSocketUpstreamControl()
+            session.upstream_control = _WebSocketUpstreamControl(opened_at=upstream_opened_at)
             session.closed = False
             session.last_upstream_close_code = None
             session.upstream_turn_state = _upstream_turn_state_from_socket(upstream) or session.upstream_turn_state

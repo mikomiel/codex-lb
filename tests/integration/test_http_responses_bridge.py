@@ -66,6 +66,7 @@ from app.modules.proxy.load_balancer import (
 )
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
@@ -10339,6 +10340,128 @@ async def test_v1_responses_http_bridge_retries_once_when_upstream_closes_before
 
     assert response.status_code == 200
     assert connect_count == 2
+
+
+class _ConnectionLimitUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "websocket_connection_limit_reached",
+                            "message": "Responses websocket connection limit reached (60 minutes). "
+                            "Create a new websocket connection to continue.",
+                        },
+                    }
+                ),
+            )
+        )
+
+
+@pytest_asyncio.fixture
+async def lifetime_bridge(async_client, app_instance, monkeypatch):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_lifetime", "lifetime@example.com")
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+    upstreams = []
+    opened = []
+
+    async def select_account(self, deadline, **kwargs):
+        assert not kwargs.get("exclude_account_ids")
+        assert kwargs.get("preferred_account_id") in {None, account.id}
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def ensure_fresh(self, target, **kwargs):
+        return target
+
+    async def connect(*args, **kwargs):
+        # Exhausting the supplied sockets fails the test rather than permitting
+        # an accidental third retry or a real upstream connection.
+        upstream = upstreams[len(opened)]
+        opened.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", select_account)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", connect)
+    return service, upstreams, opened
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_fails", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_http_bridge_recovers_connection_limit_once(async_client, lifetime_bridge, replacement_fails, stream):
+    service, upstreams, opened = lifetime_bridge
+    upstreams.extend(
+        [
+            _ConnectionLimitUpstreamWebSocket(),
+            _ConnectionLimitUpstreamWebSocket() if replacement_fails else _FakeBridgeUpstreamWebSocket(),
+        ]
+    )
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "recover the refused request",
+            "prompt_cache_key": "connection-limit",
+            "stream": stream,
+        },
+    )
+    assert len(opened) == 2
+    assert upstreams[0].closed
+    assert len(upstreams[0].sent_text) == len(upstreams[1].sent_text) == 1
+    assert response.status_code == (400 if replacement_fails else 200)
+    if replacement_fails:
+        assert response.json()["error"]["code"] == "websocket_connection_limit_reached"
+    elif stream:
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+        assert sum(event["type"] == "response.created" for event in events) == 1
+        assert sum(event["type"] == "response.completed" for event in events) == 1
+        assert not any(event["type"] in {"error", "response.failed"} for event in events)
+        completed = next(event["response"] for event in events if event["type"] == "response.completed")
+        assert completed["output"][0]["content"][0]["text"] == "OK"
+    else:
+        assert response.json()["output"][0]["content"][0]["text"] == "OK"
+
+
+@pytest.mark.asyncio
+async def test_busy_http_bridge_renews_by_socket_age_not_last_use(async_client, lifetime_bridge):
+    service, upstreams, opened = lifetime_bridge
+    clock = VirtualClock(monotonic_value=100.0, epoch_value=time.time())
+    service._clock = clock
+    upstreams.extend([_FakeBridgeUpstreamWebSocket("resp_old"), _FakeBridgeUpstreamWebSocket("resp_new")])
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "Return exactly OK.",
+        "input": "a complete standalone request",
+        "prompt_cache_key": "socket-age",
+    }
+    assert (await async_client.post("/v1/responses", json=payload)).status_code == 200
+    session = next(iter(service._http_bridge_sessions.values()))
+    clock.advance(3299.0)
+    session.last_used_at = clock.monotonic()  # recent traffic must not reset socket age
+    assert (await async_client.post("/v1/responses", json=payload)).status_code == 200
+    assert len(opened) == 1
+    clock.advance(1.0)
+    session.last_used_at = clock.monotonic()
+    response = await async_client.post("/v1/responses", json=payload)
+    assert response.status_code == 200
+    assert len(opened) == 2
+    assert upstreams[0].closed
+    assert len(upstreams[0].sent_text) == 2
+    assert len(upstreams[1].sent_text) == 1
+    assert response.json()["id"] == "resp_new_1"
+    # The replacement's own lifetime, not the bridge's initial birth, now wins.
+    assert (await async_client.post("/v1/responses", json=payload)).status_code == 200
+    assert len(opened) == 2
 
 
 @pytest.mark.asyncio
