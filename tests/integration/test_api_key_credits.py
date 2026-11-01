@@ -296,18 +296,31 @@ async def test_credit_backfill_matches_cached_and_failed_settlement_and_preserve
 
 
 @pytest.mark.asyncio
-async def test_credit_backfill_saturates_the_combined_model_groups(async_client) -> None:
+async def test_credit_backfill_saturates_the_combined_model_groups(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Request rows have INTEGER token columns on PostgreSQL. Emulate large
+    # historical group prices at the pricing boundary, not impossible row values;
+    # the real grouped query, combined cap and BIGINT counter write still run.
+    group_prices = {"gpt-6-astra": 2**63 - 8, "gpt-5.6-sol": 10}
+
+    def large_group_price(model: str | None, **usage: object) -> int:
+        assert usage["input_tokens"] == 1
+        assert usage["output_tokens"] == 0
+        return group_prices[model or ""]
+
+    monkeypatch.setattr("app.modules.api_keys.repository.credit_units_for_usage", large_group_price)
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         created = await service.create_key(ApiKeyCreateData(name="credit-history-ceiling", allowed_models=None))
-        for model, tokens in [("gpt-6-astra", 2**50), ("gpt-5.6-sol", 1)]:
+        for model in ("gpt-6-astra", "gpt-5.6-sol"):
             session.add(
                 RequestLog(
                     api_key_id=created.id,
                     request_id=model,
                     model=model,
                     status="success",
-                    input_tokens=tokens,
+                    input_tokens=1,
                     output_tokens=0,
                     requested_at=utcnow() - timedelta(minutes=1),
                 )
