@@ -35,6 +35,12 @@ The Codex client-version fallback is also retained across restarts. Bundled pric
 
 *Spec: [frontend-architecture](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/frontend-architecture)*
 
+## Recovery after reset-credit redemption
+
+A confirmed reset credit can release the account from its old rate-limit cooldown after the immediate forced usage refresh. This requires upstream to return `code="reset"` and `windows_reset > 0`, and the same pre-redemption cooldown markers must still apply. The old deadline must identify exactly one quota window in the usage baseline captured before redemption. The refreshed snapshot must show that window with a new deadline and available quota.
+
+The accounts API, dashboard API and automatic pre-expiry redemption use the same proof. Ordinary refreshes, unrelated throttle deadlines, exhausted windows, concurrent changed cooldown markers and unconfirmed redemptions do not gain this exception. A failed immediate refresh or an `already_redeemed` retry does not retain the proof for a later refresh.
+
 ## Sorting account quota
 
 On the Accounts page, use the sort selector to order accounts by status or by remaining 5-hour, weekly, or monthly quota, in either direction. Unknown quota values stay last; zero means a known exhausted quota. The choice lasts while the page is open and does not change request routing. The default remains **Most reset credits**.
